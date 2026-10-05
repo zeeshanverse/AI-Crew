@@ -1,0 +1,23 @@
+server:
+  port: 8080
+spring:
+  application:
+    name: ai_crew-backend
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/ai_crew}
+    username: ${SPRING_DATASOURCE_USERNAME:ai_crew}
+    password: ${SPRING_DATASOURCE_PASSWORD:ai_crew}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+ai_crew:
+  ai-service-url: ${AI_SERVICE_URL:http://localhost:8000}
+  internal-token: ${AI_INTERNAL_TOKEN:ai-crew-internal}
