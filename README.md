@@ -85,18 +85,12 @@ Agents never write to the database directly. They can only propose, and the back
 ```mermaid
 
 flowchart LR
-
-    UI[React + TypeScript UI] --> API[Spring Boot API :8080]
-
-    API --> DB[(PostgreSQL)]
-
-    API --> AI[FastAPI + LangGraph AI service :8000]
-
-    AI --> API
-
-    AI -.-> LLM[OpenAI-compatible LLM via LangChain, optional]
-
-    API --> AUD[(ai_action_audit)]
+    UI["React + TypeScript UI"] --> API["Spring Boot API :8080"]
+    API --> DB[("PostgreSQL")]
+    API --> AI["FastAPI + LangGraph AI Service :8000"]
+    AI --> API
+    AI -.-> LLM["OpenAI-compatible LLM"]
+    API --> AUD[("AI Action Audit")]
 
 ```
 
