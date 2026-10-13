@@ -1,0 +1,14 @@
+﻿{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "Say exactly OK"
+        }
+      ]
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 8
+  }
+}

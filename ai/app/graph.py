@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from typing import Any, TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -47,23 +48,6 @@ def _normalise_content(content: Any) -> str:
     return str(content)
 
 
-def _extract_tool_calls(message: Any) -> list[dict[str, Any]]:
-    calls = getattr(message, "tool_calls", None) or []
-    actions = []
-    for call in calls:
-        name = call.get("name")
-        args = call.get("args", {})
-        if name in WRITE_ACTIONS:
-            actions.append({
-                "id": call.get("id", f"action-{len(actions)+1}"),
-                "tool": name,
-                "description": WRITE_ACTIONS[name]["description"],
-                "arguments": args,
-                "requires_approval": True,
-            })
-    return actions
-
-
 def llm_settings() -> tuple[str, str | None, str]:
     """Return (api_key, base_url, model).
 
@@ -99,89 +83,186 @@ def _friendly_error(exc: Exception) -> str:
     return f"the AI provider returned an error ({name})"
 
 
-def _build_llm(agent: str):
+def _chat_model():
+    """Plain chat model for any OpenAI-compatible provider (no tool binding)."""
     from langchain_openai import ChatOpenAI
     api_key, base_url, model = llm_settings()
-    kwargs: dict[str, Any] = {"model": model, "api_key": api_key, "timeout": 60, "max_retries": 1}
+    kwargs: dict[str, Any] = {"model": model, "api_key": api_key, "timeout": 60, "max_retries": 2}
     if base_url:
         kwargs["base_url"] = base_url
-    # GPT-5 and o-series reasoning models only accept the default temperature.
-    if not model.lower().startswith(("gpt-5", "o1", "o3", "o4")):
+    # GPT-5 / o-series reasoning models and Gemini 3 models work best with the provider's default temperature.
+    if not model.lower().startswith(("gpt-5", "o1", "o3", "o4", "gemini-3")):
         kwargs["temperature"] = 0.2
-    return ChatOpenAI(**kwargs).bind_tools(READ_TOOLS + _write_tool_schemas())
+    return ChatOpenAI(**kwargs)
 
 
-def _write_tool_schemas():
-    from langchain_core.tools import StructuredTool
-    from pydantic import create_model, Field
-    tools = []
-    for name, meta in WRITE_ACTIONS.items():
-        fields = {field: (Any, Field(default=None)) for field in meta["fields"]}
-        schema = create_model(f"{name.title()}Args", **fields)
-        def proposal(**kwargs):
-            return {"requires_approval": True, "tool": name, "arguments": kwargs}
-        tools.append(StructuredTool.from_function(
-            func=proposal,
-            name=name,
-            description=meta["description"],
-            args_schema=schema,
-        ))
-    return tools
+def _build_llm(agent: str):
+    return _chat_model()
 
 
-def real_result(agent: str, objective: str, context: dict[str, Any], conversation: list[dict[str, str]]):
-    llm = _build_llm(agent)
-    system_prompt = f"""
+# Fields the backend requires before it will execute each approved action.
+REQUIRED_FIELDS = {
+    "create_goal": ["title"],
+    "create_project": ["name"],
+    "create_task": ["title"],
+    "create_metric": ["metricName", "value"],
+    "create_vendor": ["name"],
+    "record_transaction": ["type", "amount"],
+    "create_knowledge_document": ["title", "content"],
+}
+MAX_ACTIONS = 3
+CONTEXT_CHAR_LIMIT = 12000
+_JSON_BLOCK = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def _retrieve_context(objective: str) -> dict[str, Any]:
+    """Read company state and matching knowledge before reasoning.
+
+    Runs in the service itself (not as model tool calls), so it works with any provider
+    and a backend hiccup never blocks the answer.
+    """
+    tools = {t.name: t for t in READ_TOOLS}
+    context: dict[str, Any] = {}
+    try:
+        context["company_snapshot"] = tools["get_company_snapshot"].invoke({})
+    except Exception as exc:
+        logger.warning("Could not read the company snapshot: %s", exc)
+    try:
+        matches = tools["search_company_knowledge"].invoke({"query": objective[:200]})
+        if matches:
+            context["knowledge_matches"] = matches
+    except Exception as exc:
+        logger.warning("Could not search company knowledge: %s", exc)
+    return context
+
+
+def _action_catalog() -> str:
+    return "\n".join(
+        f"- {name}: fields {', '.join(meta['fields'])}. {meta['description']}"
+        for name, meta in WRITE_ACTIONS.items()
+    )
+
+
+def _system_prompt(agent: str) -> str:
+    return f"""
 You are an AI employee inside AI-Crew, a company operating system.
 {AGENT_GUIDANCE.get(agent, 'Act as a specialized company employee.')}
+Write a professional answer in Markdown. Use the retrieved company data you are given and do not invent company facts.
+Every change to company data is only a PROPOSAL that a human must approve. Never say a record was created or updated.
 
-Your response must feel like a professional assistant, not an API dump. Use Markdown.
-You have read-only tools for company state and knowledge. You may propose write actions
-using tools, but every write action MUST be treated as a proposal requiring human approval.
-Never say a record was created/updated unless the user has approved the proposed action.
-When proposing actions, make them concrete and explain why they are useful.
-Maintain the conversation context. Do not invent company facts.
+If concrete changes would help, end your reply with ONE fenced json block and nothing after it, in exactly this shape:
+```json
+{{"actions": [{{"tool": "create_goal", "arguments": {{"title": "...", "description": "..."}}}}]}}
+```
+Allowed tools (use only these names and fields):
+{_action_catalog()}
+Rules for the json block: at most {MAX_ACTIONS} actions; metric `value` and transaction `amount` must be numbers; use status PLANNED for projects and TODO for tasks; do not set projectId unless you know it from the retrieved data; omit the json block if no change is warranted.
 """
-    messages = [{"role": "system", "content": system_prompt}]
+
+
+def _parse_actions(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Split a model reply into (display text, validated action proposals)."""
+    matches = list(_JSON_BLOCK.finditer(text))
+    if not matches:
+        return text.strip(), []
+    block = matches[-1]
+    clean = (text[:block.start()] + text[block.end():]).strip()
+    try:
+        data = json.loads(block.group(1))
+    except json.JSONDecodeError:
+        return clean, []
+    raw = data.get("actions", []) if isinstance(data, dict) else []
+    actions: list[dict[str, Any]] = []
+    for item in raw if isinstance(raw, list) else []:
+        if len(actions) >= MAX_ACTIONS:
+            break
+        if not isinstance(item, dict):
+            continue
+        tool, args = item.get("tool"), item.get("arguments")
+        if tool not in WRITE_ACTIONS or not isinstance(args, dict):
+            continue
+        allowed = WRITE_ACTIONS[tool]["fields"]
+        cleaned = {k: v for k, v in args.items() if k in allowed and v not in (None, "")}
+        if any(field not in cleaned for field in REQUIRED_FIELDS.get(tool, [])):
+            continue
+        actions.append({
+            "id": f"action-{len(actions) + 1}",
+            "tool": tool,
+            "description": WRITE_ACTIONS[tool]["description"],
+            "arguments": cleaned,
+            "requires_approval": True,
+        })
+    return clean, actions
+
+
+def _drop_unknown_project_ids(actions: list[dict[str, Any]], retrieved: dict[str, Any]) -> None:
+    """A task pointing at a project that does not exist would fail on approval."""
+    projects = (retrieved.get("company_snapshot") or {}).get("projects") or []
+    known = {str(p.get("id")) for p in projects if isinstance(p, dict)}
+    for action in actions:
+        if action["tool"] == "create_task" and str(action["arguments"].get("projectId")) not in known:
+            action["arguments"].pop("projectId", None)
+
+
+def _fallback_action(agent: str, objective: str, answer: str) -> dict[str, Any] | None:
+    """First-turn proposal drafted from the answer when the model proposed nothing."""
+    title = " ".join(objective.split())[:120]
+    summary = " ".join(answer.split())[:300]
+    drafts = {
+        "CEO": ("create_goal", {"title": title, "description": summary}),
+        "MANAGER": ("create_project", {"name": title, "description": summary, "status": "PLANNED"}),
+        "SOFTWARE_ENGINEER": ("create_task", {"title": title, "description": summary, "status": "TODO",
+                                              "assignedAgent": "SOFTWARE_ENGINEER"}),
+        "RESEARCH": ("create_knowledge_document", {"title": f"Research brief: {title}", "content": answer}),
+    }
+    draft = drafts.get(agent.upper())
+    if not draft or not title:
+        return None
+    tool, args = draft
+    return {
+        "id": "action-1",
+        "tool": tool,
+        "description": WRITE_ACTIONS[tool]["description"] + " (drafted from the recommendation)",
+        "arguments": {k: v for k, v in args.items() if v},
+        "requires_approval": True,
+    }
+
+
+def live_result(agent: str, objective: str, context: dict[str, Any], conversation: list[dict[str, str]]):
+    llm = _chat_model()
+    retrieved = _retrieve_context(objective)
+    messages: list[dict[str, str]] = [{"role": "system", "content": _system_prompt(agent)}]
     for item in conversation[-16:]:
         role, content = item.get("role"), item.get("content", "")
         if role in {"user", "assistant"} and content:
             messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": f"Current request:\n{objective}\n\nKnown context supplied by the application:\n{json.dumps(context or {}, default=str)}"})
+    retrieved_text = json.dumps(retrieved, default=str)[:CONTEXT_CHAR_LIMIT]
+    messages.append({"role": "user", "content": (
+        f"Current request:\n{objective}\n\n"
+        f"Context supplied by the application:\n{json.dumps(context or {}, default=str)}\n\n"
+        f"Retrieved company data:\n{retrieved_text}"
+    )})
 
-    first = llm.invoke(messages)
-    # Execute only read-only tool calls automatically, then ask the model to synthesize.
-    tool_messages = []
-    read_calls = [c for c in (getattr(first, "tool_calls", None) or []) if c.get("name") in {t.name for t in READ_TOOLS}]
-    if read_calls:
-        tool_map = {t.name: t for t in READ_TOOLS}
-        for call in read_calls:
-            try:
-                output = tool_map[call["name"]].invoke(call.get("args", {}))
-                tool_messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": json.dumps(output, default=str)})
-            except Exception as exc:
-                tool_messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": f"Tool error: {exc}"})
-        messages.append(first)
-        messages.extend(tool_messages)
-        messages.append({"role": "user", "content": "Now synthesize the answer using the retrieved company information. Keep any write operations as approval-required proposals."})
-        final = llm.invoke(messages)
-    else:
-        final = first
+    reply = llm.invoke(messages)
+    answer, actions = _parse_actions(_normalise_content(reply.content))
+    _drop_unknown_project_ids(actions, retrieved)
+    if not answer.strip():
+        if not actions:
+            raise RuntimeError("the model returned an empty answer")
+        bullets = "\n".join(f"- **{a['tool'].replace('_', ' ')}** — {a['description']}" for a in actions)
+        answer = ("## Proposed actions\n\nI have prepared the following changes for your approval. "
+                  "No company data has been changed yet.\n\n" + bullets)
+    if not actions and not conversation:
+        fallback = _fallback_action(agent, objective, answer)
+        if fallback:
+            actions = [fallback]
 
-    actions = _extract_tool_calls(final)
-    # Some models may put action calls on the first message.
-    if not actions:
-        actions = _extract_tool_calls(first)
-    content = _normalise_content(final.content)
-    if not content.strip() and actions:
-        bullets = "\n".join(f"- **{a['tool'].replace('_',' ')}** — {a['description']}" for a in actions)
-        content = "## Proposed actions\n\nI have prepared the following changes for your approval. No company data has been changed yet.\n\n" + bullets
     return {
         "agent": agent,
         "status": "completed",
         "mode": "live",
-        "response": content,
-        "summary": content,
+        "response": answer,
+        "summary": answer,
         "actions": actions,
         "next_steps": ["Review the recommendation", "Approve useful actions", "Track outcomes in AI-Crew"],
         "suggested_follow_ups": ["Turn this into an execution plan", "What information do you need from me?", "Challenge this recommendation"],
@@ -201,7 +282,7 @@ def specialist_node(state: CompanyState):
     conversation = state.get("conversation", [])
     if live_enabled():
         try:
-            return {"result": real_result(agent, state["objective"], state.get("context", {}), conversation)}
+            return {"result": live_result(agent, state["objective"], state.get("context", {}), conversation)}
         except Exception as exc:  # provider errors must never become a raw 500
             reason = _friendly_error(exc)
             logger.warning("Live LLM call failed (%s: %s); falling back to mock", type(exc).__name__, exc)

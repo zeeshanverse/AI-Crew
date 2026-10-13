@@ -83,10 +83,36 @@ public class AiActionController {
             default -> throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Unsupported AI action: "+tool);
         };
         try {
-            db.update("INSERT INTO ai_action_audit(agent_code,tool_name,arguments,result,status) VALUES(?,?,?::jsonb,?::jsonb,?)",
-                agent == null ? "UNKNOWN" : agent, tool, new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(a),
-                new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(result), "COMPLETED");
-        } catch (Exception ignored) {}
+            String auditAgent = (agent == null || agent.isBlank())
+                    ? "UNKNOWN"
+                    : agent.trim().toUpperCase();
+
+            String argumentsJson =
+                    new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(a);
+
+            String resultJson =
+                    new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(result);
+
+            db.update(
+                    "INSERT INTO ai_action_audit " +
+                    "(agent_code, tool_name, arguments, result, status) " +
+                    "VALUES (?, ?, ?::jsonb, ?::jsonb, ?)",
+                    auditAgent,
+                    tool,
+                    argumentsJson,
+                    resultJson,
+                    "COMPLETED"
+            );
+
+        } catch (Exception e) {
+            e.printStackTrace();
+
+            throw new ResponseStatusException(
+                    HttpStatus.INTERNAL_SERVER_ERROR,
+                    "AI action executed, but audit logging failed: " + e.getMessage(),
+                    e
+            );
+        }
         return result;
     }
 

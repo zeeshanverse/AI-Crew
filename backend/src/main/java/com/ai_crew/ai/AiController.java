@@ -115,4 +115,17 @@ public class AiController {
         }
     }
 
+    @GetMapping("/audit")
+    public ResponseEntity<?> audit() {
+        try {
+            return ResponseEntity.ok(db.queryForList(
+                    "SELECT id,agent_code,tool_name,arguments::text AS arguments,result::text AS result,status,created_at " +
+                    "FROM ai_action_audit ORDER BY created_at DESC LIMIT 100"
+            ));
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("error", "Unable to load audit log"));
+        }
+    }
+
 }

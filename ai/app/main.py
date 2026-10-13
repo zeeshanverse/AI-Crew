@@ -55,12 +55,32 @@ class ActionExecuteRequest(BaseModel):
 def execute_action(request: ActionExecuteRequest):
     base = os.getenv("INTERNAL_API_BASE_URL", "http://backend:8080")
     token = os.getenv("INTERNAL_API_TOKEN", "ai-crew-internal")
+
+    arguments = dict(request.arguments)
+    agent = str(arguments.pop("__agent", "UNKNOWN")).upper()
+
     with httpx.Client(timeout=15) as client:
         response = client.post(
             f"{base}/api/ai/internal/actions/execute",
-            json={"tool": request.tool, "arguments": request.arguments},
-            headers={"X-AI-Crew-Internal": token, "X-AI-Crew-Agent": request.arguments.pop("__agent", "UNKNOWN") if isinstance(request.arguments, dict) else "UNKNOWN"},
+            json={
+                "tool": request.tool,
+                "arguments": arguments,
+            },
+            headers={
+                "X-AI-Crew-Internal": token,
+                "X-AI-Crew-Agent": agent,
+            },
         )
+
         if response.status_code >= 400:
-            return {"status": "failed", "tool": request.tool, "error": response.text}
-        return {"status": "completed", "tool": request.tool, "result": response.json()}
+            return {
+                "status": "failed",
+                "tool": request.tool,
+                "error": response.text,
+            }
+
+        return {
+            "status": "completed",
+            "tool": request.tool,
+            "result": response.json(),
+        }
