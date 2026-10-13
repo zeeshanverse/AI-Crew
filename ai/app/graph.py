@@ -1,9 +1,12 @@
 import json
+import logging
 import os
 from typing import Any, TypedDict
 
 from langgraph.graph import StateGraph, END
 from .agent_tools import READ_TOOLS, WRITE_ACTIONS
+
+logger = logging.getLogger("ai_crew.graph")
 
 
 class CompanyState(TypedDict, total=False):
@@ -61,10 +64,51 @@ def _extract_tool_calls(message: Any) -> list[dict[str, Any]]:
     return actions
 
 
+def llm_settings() -> tuple[str, str | None, str]:
+    """Return (api_key, base_url, model).
+
+    LLM_* variables take priority; OPENAI_* are kept for backward compatibility.
+    Any OpenAI-compatible provider works by setting LLM_BASE_URL
+    (for example Gemini, Groq, OpenRouter or a local Ollama server).
+    """
+    api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+    base_url = os.getenv("LLM_BASE_URL") or None
+    model = os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-5-mini"
+    return api_key, base_url, model
+
+
+def live_enabled() -> bool:
+    mode = os.getenv("AI_MODE", "mock").lower()
+    return mode in {"openai", "live", "llm"} and bool(llm_settings()[0])
+
+
+def _friendly_error(exc: Exception) -> str:
+    """Turn a provider exception into a short, user-facing reason."""
+    name = type(exc).__name__
+    text = str(exc).lower()
+    if "insufficient_quota" in text or "no credits" in text or "quota" in text:
+        return "the AI provider reports no remaining credits or quota"
+    if name in {"AuthenticationError", "PermissionDeniedError"} or "api key" in text:
+        return "the AI provider rejected the API key"
+    if name == "RateLimitError":
+        return "the AI provider is rate limiting requests"
+    if name in {"APIConnectionError", "APITimeoutError"}:
+        return "the AI provider could not be reached"
+    if name == "NotFoundError" or ("model" in text and "not found" in text):
+        return "the configured model name was not found for this provider"
+    return f"the AI provider returned an error ({name})"
+
+
 def _build_llm(agent: str):
     from langchain_openai import ChatOpenAI
-    model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-    return ChatOpenAI(model=model, temperature=0.2).bind_tools(READ_TOOLS + _write_tool_schemas())
+    api_key, base_url, model = llm_settings()
+    kwargs: dict[str, Any] = {"model": model, "api_key": api_key, "timeout": 60, "max_retries": 1}
+    if base_url:
+        kwargs["base_url"] = base_url
+    # GPT-5 and o-series reasoning models only accept the default temperature.
+    if not model.lower().startswith(("gpt-5", "o1", "o3", "o4")):
+        kwargs["temperature"] = 0.2
+    return ChatOpenAI(**kwargs).bind_tools(READ_TOOLS + _write_tool_schemas())
 
 
 def _write_tool_schemas():
@@ -135,7 +179,7 @@ Maintain the conversation context. Do not invent company facts.
     return {
         "agent": agent,
         "status": "completed",
-        "mode": "openai",
+        "mode": "live",
         "response": content,
         "summary": content,
         "actions": actions,
@@ -154,10 +198,21 @@ def mock_result(agent: str, objective: str, conversation: list[dict[str, str]]):
 
 def specialist_node(state: CompanyState):
     agent = state["agent"]
-    mode = os.getenv("AI_MODE", "mock").lower()
-    if mode in {"openai", "live"} and os.getenv("OPENAI_API_KEY"):
-        return {"result": real_result(agent, state["objective"], state.get("context", {}), state.get("conversation", []))}
-    return {"result": mock_result(agent, state["objective"], state.get("conversation", []))}
+    conversation = state.get("conversation", [])
+    if live_enabled():
+        try:
+            return {"result": real_result(agent, state["objective"], state.get("context", {}), conversation)}
+        except Exception as exc:  # provider errors must never become a raw 500
+            reason = _friendly_error(exc)
+            logger.warning("Live LLM call failed (%s: %s); falling back to mock", type(exc).__name__, exc)
+            result = mock_result(agent, state["objective"], conversation)
+            notice = f"> **Live AI unavailable:** {reason}. Showing the offline mock response instead.\n\n"
+            result["response"] = notice + result["response"]
+            result["summary"] = result["response"]
+            result["fallback"] = True
+            result["warning"] = reason
+            return {"result": result}
+    return {"result": mock_result(agent, state["objective"], conversation)}
 
 
 def build_graph():
@@ -172,4 +227,4 @@ GRAPH = build_graph()
 
 def run_company_graph(agent: str, objective: str, context: dict[str, Any], conversation: list[dict[str, str]] | None = None):
     state: CompanyState = {"agent": agent.upper(), "objective": objective, "context": context or {}, "conversation": conversation or []}
-    return specialist_node(state)["result"]
+    return GRAPH.invoke(state)["result"]

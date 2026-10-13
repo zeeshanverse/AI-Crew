@@ -4,7 +4,7 @@ from typing import Any
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-from .graph import run_company_graph
+from .graph import live_enabled, llm_settings, run_company_graph
 import httpx
 
 
@@ -25,12 +25,14 @@ class AgentRunRequest(BaseModel):
 
 @app.get("/health")
 def health():
+    _, base_url, model = llm_settings()
     return {
         "status": "ok",
         "service": "ai_crew-ai",
         "mode": os.getenv("AI_MODE", "mock"),
-        "model": os.getenv("OPENAI_MODEL", ""),
-        "live_enabled": bool(os.getenv("OPENAI_API_KEY")),
+        "model": model if live_enabled() else "",
+        "provider": "custom" if base_url else "openai",
+        "live_enabled": live_enabled(),
     }
 
 

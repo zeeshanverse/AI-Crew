@@ -46,6 +46,9 @@ services:
       AI_MODE: ${AI_MODE:-mock}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
       INTERNAL_API_BASE_URL: http://backend:8080
       INTERNAL_API_TOKEN: ${AI_INTERNAL_TOKEN:-ai-crew-internal}
     ports:
